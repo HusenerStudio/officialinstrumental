@@ -61,6 +61,7 @@
         <button id="generateBtn" disabled>Generate Instrumental</button>
         <button id="regenBtn" class="secondary" disabled>Regenerate Variation</button>
         <button id="testBtn" class="secondary">Audio Test</button>
+        <button id="modelBtn" class="secondary" disabled>Generate via Model</button>
         <button id="playBtn" class="secondary" disabled>Play Preview</button>
         <button id="stopBtn" class="secondary" disabled>Stop</button>
         <button id="downloadBtn" class="secondary" disabled>Download WAV</button>
@@ -75,11 +76,14 @@
 
     <!-- Tone.js -->
     <script src="https://unpkg.com/tone@latest/build/Tone.js"></script>
+    <!-- Magenta.js (local, in-browser music generator models) -->
+    <script src="https://cdn.jsdelivr.net/npm/@magenta/music@1.22.1/dist/magenta.js"></script>
     <script>
       const fileInput = document.getElementById('songFile');
       const generateBtn = document.getElementById('generateBtn');
       const regenBtn = document.getElementById('regenBtn');
       const testBtn = document.getElementById('testBtn');
+      const modelBtn = document.getElementById('modelBtn');
       const playBtn = document.getElementById('playBtn');
       const stopBtn = document.getElementById('stopBtn');
       const downloadBtn = document.getElementById('downloadBtn');
@@ -97,9 +101,11 @@
       fileInput.addEventListener('change', () => {
         if (fileInput.files && fileInput.files.length > 0) {
           generateBtn.disabled = false;
+          modelBtn.disabled = false;
           statusEl.textContent = 'Ready. Click Generate Instrumental.';
         } else {
           generateBtn.disabled = true;
+          modelBtn.disabled = true;
           statusEl.textContent = 'Upload a song to begin.';
         }
       });
@@ -310,6 +316,89 @@
         return new Blob([view], { type: 'audio/wav' });
       }
 
+      function midiToNoteName(midi) {
+        const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+        const octave = Math.floor(midi / 12) - 1;
+        const name = names[midi % 12];
+        return `${name}${octave}`;
+      }
+
+      function scheduleNoteSequence(ns, bpm) {
+        Tone.Transport.cancel();
+        Tone.Transport.bpm.value = bpm;
+        Tone.Transport.timeSignature = 4;
+
+        const master = new Tone.Gain(0.95);
+        const comp = new Tone.Compressor(-12, 3);
+        const limiter = new Tone.Limiter(-1);
+        master.chain(comp, limiter, Tone.getDestination());
+
+        const kick = new Tone.MembraneSynth({ pitchDecay: 0.02, octaves: 8, envelope: { attack: 0.001, decay: 0.2, sustain: 0.01, release: 0.8 } });
+        const snare = new Tone.NoiseSynth({ noise: { type: 'white' }, envelope: { attack: 0.005, decay: 0.2, sustain: 0 }, filterEnvelope: { attack: 0.001, decay: 0.1, sustain: 0 }, volume: -6 });
+        const hat = new Tone.MetalSynth({ frequency: 250, envelope: { attack: 0.001, decay: 0.12, release: 0.1 }, volume: -10 });
+        const bass = new Tone.MonoSynth({ oscillator: { type: 'square' }, filter: { Q: 2, type: 'lowpass', rolloff: -24 }, envelope: { attack: 0.02, decay: 0.2, sustain: 0.6, release: 0.4 }, volume: -4 });
+        const poly = new Tone.PolySynth(Tone.Synth, { oscillator: { type: 'triangle' }, envelope: { attack: 0.02, decay: 0.2, sustain: 0.6, release: 0.8 } });
+        const lead = new Tone.Synth({ oscillator: { type: 'sawtooth' }, envelope: { attack: 0.01, decay: 0.2, sustain: 0.5, release: 0.6 }, volume: -8 });
+
+        kick.connect(master);
+        snare.connect(master);
+        hat.connect(master);
+        bass.connect(master);
+        poly.connect(master);
+        lead.connect(master);
+
+        const tempoQpm = (ns.tempos && ns.tempos.length > 0) ? ns.tempos[0].qpm : 120;
+        const scaleFactor = tempoQpm > 0 ? (tempoQpm / bpm) : 1;
+
+        const kickPart = new Tone.Part((time) => { kick.triggerAttackRelease('C1', '8n', time); }, []);
+        const snarePart = new Tone.Part((time) => { snare.triggerAttackRelease('16n', time); }, []);
+        const hatPart = new Tone.Part((time) => { hat.triggerAttackRelease('32n', time); }, []);
+        const bassPart = new Tone.Part((time, note) => { bass.triggerAttackRelease(note, '8n', time); }, []);
+        const polyPart = new Tone.Part((time, chord) => { poly.triggerAttackRelease(chord, '8n', time); }, []);
+        const leadPart = new Tone.Part((time, note) => { lead.triggerAttackRelease(note, '8n', time); }, []);
+
+        // Group non-drum notes: low pitches -> bass, mid/high -> poly/lead alternating
+        let leadToggle = false;
+        for (const note of ns.notes || []) {
+          const start = (note.startTime || 0) * scaleFactor;
+          const end = (note.endTime || start) * scaleFactor;
+          const durSeconds = Math.max(0.05, end - start);
+
+          if (note.isDrum) {
+            // Common drum MIDI pitches mapping
+            if (note.pitch === 36 || note.pitch === 35) {
+              kickPart.add({ time: start });
+            } else if (note.pitch === 38 || note.pitch === 40) {
+              snarePart.add(start);
+            } else if (note.pitch === 42 || note.pitch === 46 || note.pitch === 44) {
+              hatPart.add(start);
+            } else {
+              // Fallback to hat for unknown drums
+              hatPart.add(start);
+            }
+          } else {
+            const noteName = midiToNoteName(note.pitch);
+            if (note.pitch <= 52) {
+              bassPart.add({ time: start, note: noteName });
+            } else {
+              if (leadToggle) {
+                leadPart.add({ time: start, note: noteName });
+              } else {
+                polyPart.add({ time: start, chord: [noteName] });
+              }
+              leadToggle = !leadToggle;
+            }
+          }
+        }
+
+        kickPart.start(0);
+        snarePart.start(0);
+        hatPart.start(0);
+        bassPart.start(0);
+        polyPart.start(0);
+        leadPart.start(0);
+      }
+
       async function generateInstrumental() {
         if (!fileInput.files || fileInput.files.length === 0) return;
         const file = fileInput.files[0];
@@ -349,9 +438,59 @@
         statusEl.textContent = 'Instrumental ready. You can preview or download.';
       }
 
+      async function generateInstrumentalViaModel() {
+        if (!fileInput.files || fileInput.files.length === 0) return;
+        const file = fileInput.files[0];
+        statusEl.textContent = 'Loading local music model...';
+        await Tone.start();
+
+        if (typeof mm === 'undefined' || !mm || !mm.MusicVAE) {
+          statusEl.textContent = 'Magenta.js failed to load. Check your internet and try again.';
+          return;
+        }
+
+        const durationSec = await getAudioDuration(file);
+        const hashHex = await hashFile(file);
+        const baseParams = deriveParamsFromHash(hashHex, variation);
+
+        // Load trio model (drums, bass, piano) — runs locally in browser
+        const vae = new mm.MusicVAE('https://storage.googleapis.com/magentadata/js/checkpoints/music_vae/trio_4bar');
+        await vae.initialize();
+        statusEl.textContent = 'Generating with model...';
+
+        // Estimate how many 4-bar segments we need to roughly match the song length
+        const secondsPerBar = 4 * 60 / baseParams.bpm; // 4 beats per bar
+        const approxSegmentSeconds = secondsPerBar * 4; // 4-bar segment
+        const segments = Math.max(1, Math.min(8, Math.ceil(durationSec / approxSegmentSeconds)));
+
+        const samples = await vae.sample(segments);
+        const combined = mm.sequences.concatenate(samples);
+        combined.tempos = [{ qpm: baseParams.bpm }];
+
+        const totalDuration = segments * approxSegmentSeconds;
+        paramsBadge.textContent = `Model • ${baseParams.bpm} BPM • ~${Math.round(totalDuration)}s • Var ${variation}`;
+
+        statusEl.textContent = 'Rendering instrumental (offline render)...';
+        const toneBuffer = await Tone.Offline(() => {
+          scheduleNoteSequence(combined, baseParams.bpm);
+        }, totalDuration);
+
+        const audioBuffer = toneBuffer.get();
+        recordedBlob = audioBufferToWav(audioBuffer);
+
+        const url = URL.createObjectURL(recordedBlob);
+        previewAudio.src = url;
+        previewAudio.style.display = 'block';
+        playBtn.disabled = false;
+        stopBtn.disabled = false;
+        downloadBtn.disabled = false;
+        statusEl.textContent = 'Model instrumental ready. You can preview or download.';
+      }
+
       generateBtn.addEventListener('click', async () => {
         generateBtn.disabled = true;
         regenBtn.disabled = true;
+        modelBtn.disabled = true;
         playBtn.disabled = true;
         stopBtn.disabled = true;
         downloadBtn.disabled = true;
@@ -359,6 +498,7 @@
         await generateInstrumental();
         generateBtn.disabled = false;
         regenBtn.disabled = false;
+        modelBtn.disabled = false;
       });
 
       regenBtn.addEventListener('click', async () => {
@@ -411,3 +551,16 @@
     </script>
   </body>
   </html>
+      modelBtn.addEventListener('click', async () => {
+        modelBtn.disabled = true;
+        generateBtn.disabled = true;
+        regenBtn.disabled = true;
+        playBtn.disabled = true;
+        stopBtn.disabled = true;
+        downloadBtn.disabled = true;
+        previewAudio.pause();
+        await generateInstrumentalViaModel();
+        modelBtn.disabled = false;
+        generateBtn.disabled = false;
+        regenBtn.disabled = false;
+      });
