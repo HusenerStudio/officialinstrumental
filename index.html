@@ -59,6 +59,8 @@
       <div class="row" style="margin-top: 1rem;">
         <input type="file" id="songFile" accept="audio/*" />
         <button id="generateBtn" disabled>Generate Instrumental</button>
+        <button id="regenBtn" class="secondary" disabled>Regenerate Variation</button>
+        <button id="testBtn" class="secondary">Audio Test</button>
         <button id="playBtn" class="secondary" disabled>Play Preview</button>
         <button id="stopBtn" class="secondary" disabled>Stop</button>
         <button id="downloadBtn" class="secondary" disabled>Download WAV</button>
@@ -76,6 +78,8 @@
     <script>
       const fileInput = document.getElementById('songFile');
       const generateBtn = document.getElementById('generateBtn');
+      const regenBtn = document.getElementById('regenBtn');
+      const testBtn = document.getElementById('testBtn');
       const playBtn = document.getElementById('playBtn');
       const stopBtn = document.getElementById('stopBtn');
       const downloadBtn = document.getElementById('downloadBtn');
@@ -88,6 +92,7 @@
       let parts = [];
       let synths = {};
       let compositionLengthSeconds = 8; // shorter render for faster generation
+      let variation = 0; // increment to regenerate new variation for the same file
 
       fileInput.addEventListener('change', () => {
         if (fileInput.files && fileInput.files.length > 0) {
@@ -113,15 +118,15 @@
         return bytesToHex(bytes);
       }
 
-      function deriveParamsFromHash(hashHex) {
+      function deriveParamsFromHash(hashHex, salt = 0) {
         // Use slices of the hash to derive deterministic parameters
         const h = hashHex;
         const toInt = (hex) => parseInt(hex, 16);
-        const bpm = 88 + (toInt(h.slice(0, 2)) % 53); // 88..140
-        const isMajor = (toInt(h.slice(2, 4)) % 2) === 0;
+        const bpm = 88 + ((toInt(h.slice(0, 2)) + salt) % 53); // 88..140
+        const isMajor = ((toInt(h.slice(2, 4)) + salt) % 2) === 0;
         const roots = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-        const root = roots[toInt(h.slice(4, 6)) % roots.length];
-        const energy = (toInt(h.slice(6, 8)) % 100) / 100; // 0..1
+        const root = roots[(toInt(h.slice(4, 6)) + salt) % roots.length];
+        const energy = ((toInt(h.slice(6, 8)) + salt) % 100) / 100; // 0..1
         return { bpm, isMajor, root, energy };
       }
 
@@ -162,12 +167,24 @@
         Tone.Transport.timeSignature = 4;
 
         // Instruments
-        const kick = new Tone.MembraneSynth({ pitchDecay: 0.02, octaves: 8, envelope: { attack: 0.001, decay: 0.2, sustain: 0.01, release: 0.8 } }).toDestination();
-        const snare = new Tone.NoiseSynth({ noise: { type: 'white' }, envelope: { attack: 0.005, decay: 0.2, sustain: 0 }, filterEnvelope: { attack: 0.001, decay: 0.1, sustain: 0 }, volume: -6 }).toDestination();
-        const hat = new Tone.MetalSynth({ frequency: 200, envelope: { attack: 0.001, decay: 0.1, release: 0.1 }, volume: -10 }).toDestination();
-        const bass = new Tone.MonoSynth({ oscillator: { type: 'square' }, filter: { Q: 2, type: 'lowpass', rolloff: -24 }, envelope: { attack: 0.02, decay: 0.2, sustain: 0.6, release: 0.4 }, volume: -4 }).toDestination();
-        const poly = new Tone.PolySynth(Tone.Synth, { oscillator: { type: 'triangle' }, envelope: { attack: 0.02, decay: 0.2, sustain: 0.6, release: 0.8 } }).toDestination();
-        const lead = new Tone.Synth({ oscillator: { type: 'sawtooth' }, envelope: { attack: 0.01, decay: 0.2, sustain: 0.5, release: 0.6 }, volume: -8 }).toDestination();
+        const master = new Tone.Gain(0.95);
+        const comp = new Tone.Compressor(-12, 3);
+        const limiter = new Tone.Limiter(-1);
+        master.chain(comp, limiter, Tone.getDestination());
+
+        const kick = new Tone.MembraneSynth({ pitchDecay: 0.02, octaves: 8, envelope: { attack: 0.001, decay: 0.2, sustain: 0.01, release: 0.8 } });
+        const snare = new Tone.NoiseSynth({ noise: { type: 'white' }, envelope: { attack: 0.005, decay: 0.2, sustain: 0 }, filterEnvelope: { attack: 0.001, decay: 0.1, sustain: 0 }, volume: -6 });
+        const hat = new Tone.MetalSynth({ frequency: 250, envelope: { attack: 0.001, decay: 0.12, release: 0.1 }, volume: -10 });
+        const bass = new Tone.MonoSynth({ oscillator: { type: 'square' }, filter: { Q: 2, type: 'lowpass', rolloff: -24 }, envelope: { attack: 0.02, decay: 0.2, sustain: 0.6, release: 0.4 }, volume: -4 });
+        const poly = new Tone.PolySynth(Tone.Synth, { oscillator: { type: 'triangle' }, envelope: { attack: 0.02, decay: 0.2, sustain: 0.6, release: 0.8 } });
+        const lead = new Tone.Synth({ oscillator: { type: 'sawtooth' }, envelope: { attack: 0.01, decay: 0.2, sustain: 0.5, release: 0.6 }, volume: -8 });
+
+        kick.connect(master);
+        snare.connect(master);
+        hat.connect(master);
+        bass.connect(master);
+        poly.connect(master);
+        lead.connect(master);
         synths = { kick, snare, hat, bass, poly, lead };
 
         // Precompute durations in seconds based on current bpm
@@ -301,7 +318,7 @@
 
         const durationSec = await getAudioDuration(file);
         const hashHex = await hashFile(file);
-        const baseParams = deriveParamsFromHash(hashHex);
+        const baseParams = deriveParamsFromHash(hashHex, variation);
         const scale = buildScale(baseParams.root, baseParams.isMajor);
 
         // Compute bar count to roughly match the song length
@@ -310,7 +327,7 @@
         const bars = Math.max(4, Math.round(durationSec / secondsPerBar));
         const totalDuration = bars * secondsPerBar;
 
-        paramsBadge.textContent = `${baseParams.root} ${baseParams.isMajor ? 'Major' : 'Minor'} • ${baseParams.bpm} BPM • ~${Math.round(totalDuration)}s`;
+        paramsBadge.textContent = `${baseParams.root} ${baseParams.isMajor ? 'Major' : 'Minor'} • ${baseParams.bpm} BPM • ~${Math.round(totalDuration)}s • Var ${variation}`;
 
         clearParts();
 
@@ -334,12 +351,20 @@
 
       generateBtn.addEventListener('click', async () => {
         generateBtn.disabled = true;
+        regenBtn.disabled = true;
         playBtn.disabled = true;
         stopBtn.disabled = true;
         downloadBtn.disabled = true;
         previewAudio.pause();
         await generateInstrumental();
         generateBtn.disabled = false;
+        regenBtn.disabled = false;
+      });
+
+      regenBtn.addEventListener('click', async () => {
+        if (!fileInput.files || fileInput.files.length === 0) return;
+        variation++;
+        generateBtn.click();
       });
 
       playBtn.addEventListener('click', () => {
@@ -359,6 +384,29 @@
         a.href = URL.createObjectURL(recordedBlob);
         a.download = 'instrumental.wav';
         a.click();
+      });
+
+      // Quick offline audio test to confirm sound works
+      testBtn.addEventListener('click', async () => {
+        statusEl.textContent = 'Running audio test...';
+        await Tone.start();
+        const toneBuffer = await Tone.Offline(() => {
+          const master = new Tone.Gain(0.95).toDestination();
+          const testSynth = new Tone.Synth({ oscillator: { type: 'sine' } });
+          testSynth.connect(master);
+          const testPart = new Tone.Part((time) => {
+            testSynth.triggerAttackRelease('A4', '8n', time);
+          }, [{ time: 0 }, { time: 0.5 }]);
+          testPart.start(0);
+        }, 1.0);
+        recordedBlob = audioBufferToWav(toneBuffer.get());
+        const url = URL.createObjectURL(recordedBlob);
+        previewAudio.src = url;
+        previewAudio.style.display = 'block';
+        playBtn.disabled = false;
+        stopBtn.disabled = false;
+        downloadBtn.disabled = false;
+        statusEl.textContent = 'Audio test ready. Press Play.';
       });
     </script>
   </body>
